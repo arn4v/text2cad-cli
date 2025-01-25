@@ -92,34 +92,39 @@ class OpenSCADRenderer {
       const outputFile = join(this.tempDir, `${view.name}.png`);
 
       try {
-        const validatedDistance = Math.max(view.distance, 50);
+        // Base distance should be closer to the object
+        const baseDistance = 100;
+        const validatedDistance = Math.max(view.distance, baseDistance);
         const [rotX, rotY, rotZ] = view.angle;
 
-        // Convert angles to radians
-        const radX = (rotX * Math.PI) / 180;
-        const radY = (rotY * Math.PI) / 180;
-        const radZ = (rotZ * Math.PI) / 180;
-
-        // Calculate camera position
-        const eye = [
-          validatedDistance * Math.cos(radY) * Math.cos(radZ),
-          validatedDistance * Math.sin(radZ),
-          validatedDistance * Math.sin(radY),
-        ];
-
-        // Calculate look-at point (center)
-        const center = [0, 0, 0];
+        // Calculate camera position based on the view
+        let cameraParams;
+        switch (view.name) {
+          case "front":
+            // Slight angle to show depth, centered on ports
+            cameraParams = `0,0,0,0,5,0,${baseDistance}`;
+            break;
+          case "top":
+            // Pure top view with slight rotation for better orientation
+            cameraParams = `0,0,0,90,0,10,${baseDistance}`;
+            break;
+          case "iso":
+            // Standard isometric view angles with adjusted distance
+            cameraParams = `20,0,0,35,0,25,${baseDistance * 1.2}`;
+            break;
+          default:
+            cameraParams = `0,0,0,${rotX},${rotY},${rotZ},${validatedDistance}`;
+        }
 
         await execa("openscad", [
           "-o",
           outputFile,
-          "--camera",
-          `=${eye.join(",")},${center.join(",")}`,
-          "--viewall",
           "--imgsize=1024,768",
+          "--viewall",
           "--colorscheme=Cornfield",
           "--projection=ortho",
           "--preview",
+          `--camera=${cameraParams}`,
           modelFile,
         ]);
 
