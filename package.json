@@ -4,8 +4,7 @@
   "type": "module",
   "devDependencies": {
     "@types/bun": "latest",
-    "@types/node": "^20.11.24",
-    "@types/dotenv": "^8.2.0"
+    "@types/node": "^20.11.24"
   },
   "peerDependencies": {
     "typescript": "^5.0.0"
@@ -14,7 +13,6 @@
     "@anthropic-ai/sdk": "^0.36.2",
     "cac": "^6.7.14",
     "execa": "^9.5.2",
-    "yaml": "^2.7.0",
-    "dotenv": "^16.4.5"
+    "yaml": "^2.7.0"
   }
 }

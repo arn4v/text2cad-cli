@@ -1,16 +1,11 @@
 import { execa } from "execa";
 import { Anthropic } from "@anthropic-ai/sdk";
 import cac from "cac";
-import { parse } from "yaml";
 import { writeFile, readFile, mkdir, rm } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
 import { tmpdir, homedir } from "os";
 import { randomUUID } from "crypto";
-import { config } from "dotenv";
-
-// Load environment variables from .env file
-config();
 
 // Types
 interface ViewSpec {
@@ -72,12 +67,12 @@ CRITICAL: Your responses must exactly follow this format, with no deviations:
 </openscad>
 
 views:
-  - name: "front"
-    angle: [0, 0, 0]
-    distance: 100
-  - name: "iso"
-    angle: [45, 35, 0]
-    distance: 100
+- name: "front"
+  angle: [0, 0, 0]
+  distance: 100
+- name: "iso"
+  angle: [45, 35, 0]
+  distance: 100
 
 Do not add any text between sections. Maintain exact indentation as shown.`;
 
@@ -103,20 +98,45 @@ class OpenSCADRenderer {
       const outputFile = join(this.tempDir, `${view.name}.png`);
 
       try {
-        await execa("openscad", [
+        // Validate view parameters
+        if (!Array.isArray(view.angle) || view.angle.length !== 3) {
+          throw new Error(`Invalid angle array for view ${view.name}`);
+        }
+        if (typeof view.distance !== "number" || view.distance <= 0) {
+          throw new Error(`Invalid distance value for view ${view.name}`);
+        }
+
+        // Construct camera parameters using eye/center format
+        const cameraParams = [
+          `0,0,${view.distance}`, // eye position (looking from above)
+          "0,0,0", // center position (looking at origin)
+        ].join(",");
+
+        const args = [
           "-o",
           outputFile,
-          "--camera",
-          `${view.angle.join(",")},${view.distance}`,
+          "--colorscheme=Cornfield",
+          "--imgsize=1024,768",
+          "--viewall",
+          "--projection=ortho",
           "--preview",
+          "--camera",
+          cameraParams,
           modelFile,
-        ]);
+        ];
+
+        await execa("openscad", args);
 
         const imageData = await readFile(outputFile);
         const renderDir = join(RENDERS_DIR, randomUUID());
         await mkdir(renderDir, { recursive: true });
-        await writeFile(join(renderDir, `${view.name}.png`), imageData);
 
+        // Save the rendered image
+        const savedImagePath = join(renderDir, `${view.name}.png`);
+        await writeFile(savedImagePath, imageData);
+        console.log(`Saved render to: ${savedImagePath}`);
+
+        // Add to renders array
         renders.push({
           view: view.name,
           image: imageData.toString("base64"),
@@ -193,7 +213,7 @@ class CADSession {
     content: string | MessageContent[];
   }): Promise<CADModel> {
     const response = await this.anthropic.messages.create({
-      model: "claude-3-opus-20240229",
+      model: "claude-3-5-sonnet-latest",
       max_tokens: 4096,
       system: SYSTEM_PROMPT,
       messages: [
@@ -206,71 +226,104 @@ class CADSession {
     });
 
     let fullResponse = "";
+    let lastChunkWasNewline = false;
+
     for await (const chunk of response) {
       if (
         chunk.type === "content_block_delta" &&
         chunk.delta.type === "text_delta"
       ) {
         const text = chunk.delta.text;
+        if (text === "\n") {
+          if (!lastChunkWasNewline) {
+            process.stdout.write(text);
+            lastChunkWasNewline = true;
+          }
+        } else {
+          process.stdout.write(text);
+          lastChunkWasNewline = false;
+        }
         fullResponse += text;
-        process.stdout.write(text);
       }
     }
-    console.log("\n"); // Add newline after streaming completes
+
+    if (!lastChunkWasNewline) {
+      console.log();
+    }
 
     return this.parseResponse(fullResponse);
   }
 
   private parseResponse(response: string): CADModel {
-    // Get OpenSCAD code
     const codeMatch = response.match(/<openscad>([\s\S]*?)<\/openscad>/);
     if (!codeMatch) {
+      console.error("Full response:", response);
       throw new Error(
         "Could not find OpenSCAD code section. Response must include <openscad> tags."
       );
     }
 
-    // Get YAML section with stricter matching
-    const yamlMatch = response.match(
-      /views:\s*((?:[\s\S]*?\n  - [\s\S]*?)+)(?:\n\n|$)/
-    );
-    if (!yamlMatch) {
-      throw new Error("Could not find properly formatted views section");
-    }
-
     try {
       const code = codeMatch[1].trim();
-      // Ensure proper YAML indentation
-      const yamlText =
-        "views:\n" +
-        yamlMatch[1]
-          .split("\n")
-          .map((line) => `  ${line}`)
-          .join("\n");
-      const parsedYaml = parse(yamlText);
+      console.log(
+        "\nExtracted OpenSCAD code length:",
+        code.length,
+        "characters"
+      );
 
-      if (!parsedYaml || !Array.isArray(parsedYaml.views)) {
-        throw new Error("Invalid views format - must be an array");
+      // Default views as fallback
+      const defaultViews: ViewSpec[] = [
+        {
+          name: "front",
+          angle: [0, 0, 0] as [number, number, number],
+          distance: 100,
+        },
+        {
+          name: "iso",
+          angle: [45, 35, 0] as [number, number, number],
+          distance: 100,
+        },
+      ];
+
+      let views = defaultViews;
+      const viewsSectionMatch = response.match(
+        /views:([\s\S]*?)(?=\n\n|<\/|$)/i
+      );
+
+      if (viewsSectionMatch) {
+        try {
+          const viewsText = viewsSectionMatch[1];
+          const viewEntries = viewsText.split(/(?:\n\s*)?-\s*/).filter(Boolean);
+
+          views = viewEntries.map((viewText) => {
+            const nameMatch = viewText.match(/name\s*:\s*"([^"]+)"/i);
+            const angleMatch = viewText.match(/angle\s*:\s*\[([^\]]+)\]/i);
+            const distanceMatch = viewText.match(/distance\s*:\s*(\d+)/i);
+
+            if (!nameMatch || !angleMatch) {
+              throw new Error("Invalid view format - missing required fields");
+            }
+
+            const angleParts = angleMatch[1].split(/\s*,\s*/).map(Number);
+            if (angleParts.length !== 3 || angleParts.some(isNaN)) {
+              throw new Error(`Invalid angle values: ${angleMatch[1]}`);
+            }
+
+            return {
+              name: nameMatch[1],
+              angle: angleParts as [number, number, number],
+              distance: distanceMatch ? parseInt(distanceMatch[1], 10) : 100,
+            };
+          });
+
+          console.log("Successfully parsed views:", views);
+        } catch (error) {
+          console.warn("Failed to parse views section, using defaults:", error);
+          views = defaultViews;
+        }
       }
 
-      // Validate view structure
-      parsedYaml.views.forEach((view: any, index: number) => {
-        if (!view.name || typeof view.name !== "string") {
-          throw new Error(`View ${index} missing name property`);
-        }
-        if (!Array.isArray(view.angle) || view.angle.length !== 3) {
-          throw new Error(
-            `View ${index} (${view.name}) has invalid angle format`
-          );
-        }
-        if (typeof view.distance !== "number") {
-          throw new Error(
-            `View ${index} (${view.name}) missing distance property`
-          );
-        }
-      });
-
-      return { code, views: parsedYaml.views };
+      return { code, views };
     } catch (error: unknown) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
@@ -291,12 +344,12 @@ IMPORTANT: Your response must follow this exact format:
 </openscad>
 
 views:
-  - name: "front"
-    angle: [0, 0, 0]
-    distance: 100
-  - name: "iso"
-    angle: [45, 35, 0]
-    distance: 100
+- name: "front"
+  angle: [0, 0, 0]
+  distance: 100
+- name: "iso"
+  angle: [45, 35, 0]
+  distance: 100
 
 Do not include any other text between these sections.`;
   }
@@ -325,7 +378,6 @@ Please analyze the following renders and make the requested improvements:`,
       },
     ];
 
-    // Add each render with its view description
     renders.forEach((render) => {
       content.push(
         {
@@ -357,7 +409,7 @@ Please analyze the following renders and make the requested improvements:`,
     const iteration: IterationState = {
       timestamp: new Date().toISOString(),
       code: model.code,
-      renders: [], // Filled after rendering
+      renders: [],
       feedback,
     };
 
@@ -386,7 +438,6 @@ Please analyze the following renders and make the requested improvements:`,
 async function main() {
   const cli = cac("cad-forge");
 
-  // Check environment
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     console.error(`Error: ANTHROPIC_API_KEY environment variable is required.
@@ -395,7 +446,6 @@ ANTHROPIC_API_KEY=your-api-key-here`);
     process.exit(1);
   }
 
-  // Check OpenSCAD installation
   try {
     await execa("openscad", ["--version"]);
   } catch (error) {
@@ -403,7 +453,6 @@ ANTHROPIC_API_KEY=your-api-key-here`);
     process.exit(1);
   }
 
-  // Create required directories
   await mkdir(STATE_DIR, { recursive: true });
   await mkdir(RENDERS_DIR, { recursive: true });
 
@@ -416,12 +465,9 @@ ANTHROPIC_API_KEY=your-api-key-here`);
       try {
         console.log("Generating model...");
         const model = await session.generateModel(prompt);
-        console.log(model);
-
         console.log("Rendering views...");
         const renders = await renderer.render(model);
 
-        // Update the iteration with renders
         const state = await readFile(join(STATE_DIR, "state.json"), "utf8");
         const projectState: ProjectState = JSON.parse(state);
         projectState.iterations[projectState.iterations.length - 1].renders =
@@ -449,11 +495,9 @@ ANTHROPIC_API_KEY=your-api-key-here`);
       try {
         console.log("Loading previous model...");
         const model = await session.iterateModel(feedback);
-
         console.log("Rendering new views...");
         const renders = await renderer.render(model);
 
-        // Update the iteration with renders
         const state = await readFile(join(STATE_DIR, "state.json"), "utf8");
         const projectState: ProjectState = JSON.parse(state);
         projectState.iterations[projectState.iterations.length - 1].renders =
