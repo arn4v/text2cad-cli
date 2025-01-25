@@ -55,26 +55,47 @@ interface TextContent {
 type MessageContent = TextContent | ImageContent;
 
 // Constants
-const SYSTEM_PROMPT = `You are an expert CAD designer using OpenSCAD. Your task is to generate 3D models based on descriptions and iteratively improve them based on feedback.
+const SYSTEM_PROMPT = `You are an expert CAD designer using OpenSCAD. Follow these strict rules:
 
-CRITICAL: Your responses must exactly follow this format, with no deviations:
+1. VIEW ORIENTATION:
+- Use standard engineering views with RIGHT-HAND RULE coordinate system:
+  * +X = Right, +Y = Back, +Z = Up
+  * Front view looks along +Y axis
+  * Top view looks along +Z axis
+- Include these required views:
+  * front: [0, 0, 0] (facing forward)
+  * back: [0, 180, 0]
+  * left: [0, 90, 0]
+  * right: [0, -90, 0]
+  * top: [90, 0, 0]
+  * bottom: [-90, 0, 0]
+  * iso: [45, 35, 0]
 
+2. COMPONENT PLACEMENT:
+- Ports/connectors must be on correct faces:
+  * USB/HDMI on front/back as per actual device
+  * Mounting holes on bottom
+  * Ventilation on top/sides
+- Verify component orientation with 3D coordinate system
+
+3. DESIGN RULES:
+- Model origin at center of base
+- Align components with axes
+- Add comments for complex geometry
+
+4. RESPONSE FORMAT:
 <openscad>
-// Your OpenSCAD code here
-// Use precise measurements
-// Follow OpenSCAD best practices
-// Consider printability
+// Code here
 </openscad>
 
 views:
-- name: "front"
-  angle: [0, 0, 0]
-  distance: 100
-- name: "iso"
-  angle: [45, 35, 0]
-  distance: 100
-
-Do not add any text between sections. Maintain exact indentation as shown.`;
+- name: "front" angle: [0,0,0] distance: 150
+- name: "back" angle: [0,180,0] distance: 150
+- name: "left" angle: [0,90,0] distance: 150
+- name: "right" angle: [0,-90,0] distance: 150 
+- name: "top" angle: [90,0,0] distance: 150
+- name: "bottom" angle: [-90,0,0] distance: 150
+- name: "iso" angle: [45,35,0] distance: 200`;
 
 const STATE_DIR = join(homedir(), ".cad-forge");
 const RENDERS_DIR = join(STATE_DIR, "renders");
@@ -85,12 +106,14 @@ class OpenSCADRenderer {
 
   async render(model: CADModel): Promise<RenderResult[]> {
     await this.cleanup();
-
     this.tempDir = join(tmpdir(), `cad-forge-${Date.now()}`);
     await mkdir(this.tempDir, { recursive: true });
 
     const modelFile = join(this.tempDir, "model.scad");
     await writeFile(modelFile, model.code);
+
+    const renderDir = join(RENDERS_DIR, randomUUID());
+    await mkdir(renderDir, { recursive: true });
 
     const renders: RenderResult[] = [];
 
@@ -98,53 +121,57 @@ class OpenSCADRenderer {
       const outputFile = join(this.tempDir, `${view.name}.png`);
 
       try {
-        // Validate view parameters
-        if (!Array.isArray(view.angle) || view.angle.length !== 3) {
-          throw new Error(`Invalid angle array for view ${view.name}`);
-        }
-        if (typeof view.distance !== "number" || view.distance <= 0) {
-          throw new Error(`Invalid distance value for view ${view.name}`);
-        }
+        // Convert angles to radians
+        const azimuth = (view.angle[0] * Math.PI) / 180;
+        const elevation = (view.angle[1] * Math.PI) / 180;
+        const tilt = (view.angle[2] * Math.PI) / 180;
 
-        // Construct camera parameters using eye/center format
-        const cameraParams = [
-          `0,0,${view.distance}`, // eye position (looking from above)
-          "0,0,0", // center position (looking at origin)
-        ].join(",");
-
-        const args = [
-          "-o",
-          outputFile,
-          "--colorscheme=Cornfield",
-          "--imgsize=1024,768",
-          "--viewall",
-          "--projection=ortho",
-          "--preview",
-          "--camera",
-          cameraParams,
-          modelFile,
+        // Calculate eye position using spherical coordinates
+        const eye = [
+          view.distance * Math.cos(azimuth) * Math.cos(elevation),
+          view.distance * Math.sin(azimuth) * Math.cos(elevation),
+          view.distance * Math.sin(elevation),
         ];
 
-        await execa("openscad", args);
+        // Calculate center point with tilt adjustment
+        const center = [
+          Math.cos(tilt) * 0.1 * view.distance,
+          Math.sin(tilt) * 0.1 * view.distance,
+          0,
+        ];
+
+        const cameraParams = `=${eye.join(",")},${center.join(",")}`;
+
+        await execa("openscad", [
+          "-o",
+          outputFile,
+          "--camera",
+          cameraParams,
+          "--viewall",
+          "--imgsize=1024,768",
+          "--colorscheme=Cornfield",
+          "--projection=ortho",
+          "--preview",
+          modelFile,
+        ]);
 
         const imageData = await readFile(outputFile);
-        const renderDir = join(RENDERS_DIR, randomUUID());
-        await mkdir(renderDir, { recursive: true });
+        const finalPath = join(renderDir, `${view.name}.png`);
+        await writeFile(finalPath, imageData);
 
-        // Save the rendered image
-        const savedImagePath = join(renderDir, `${view.name}.png`);
-        await writeFile(savedImagePath, imageData);
-        console.log(`Saved render to: ${savedImagePath}`);
-
-        // Add to renders array
         renders.push({
           view: view.name,
           image: imageData.toString("base64"),
         });
-      } catch (error: unknown) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        throw new Error(`Failed to render view ${view.name}: ${errorMessage}`);
+
+        console.log(`Rendered ${view.name} view to: ${finalPath}`);
+      } catch (error) {
+        await this.cleanup();
+        throw new Error(
+          `Failed to render ${view.name}: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
       }
     }
 
@@ -155,11 +182,10 @@ class OpenSCADRenderer {
   private async cleanup() {
     if (this.tempDir && existsSync(this.tempDir)) {
       await rm(this.tempDir, { recursive: true, force: true });
-      this.tempDir = null;
     }
+    this.tempDir = null;
   }
 }
-
 // LLM Session Handler
 class CADSession {
   private state: ProjectState | null = null;
@@ -255,84 +281,74 @@ class CADSession {
   }
 
   private parseResponse(response: string): CADModel {
-    const codeMatch = response.match(/<openscad>([\s\S]*?)<\/openscad>/);
-    if (!codeMatch) {
-      console.error("Full response:", response);
-      throw new Error(
-        "Could not find OpenSCAD code section. Response must include <openscad> tags."
-      );
-    }
+    const codeMatch = response.match(/<openscad>([\s\S]*?)<\/openscad>/i);
+    if (!codeMatch) throw new Error("Missing OpenSCAD code section");
 
-    try {
-      const code = codeMatch[1].trim();
-      console.log(
-        "\nExtracted OpenSCAD code length:",
-        code.length,
-        "characters"
-      );
+    const code = codeMatch[1].trim();
+    const views: ViewSpec[] = [];
+    const viewErrors: string[] = [];
 
-      // Default views as fallback
-      const defaultViews: ViewSpec[] = [
-        {
-          name: "front",
-          angle: [0, 0, 0] as [number, number, number],
-          distance: 100,
-        },
-        {
-          name: "iso",
-          angle: [45, 35, 0] as [number, number, number],
-          distance: 100,
-        },
-      ];
+    const viewsSection = response.match(/views:([\s\S]*?)(?=\n\n|<\/|$)/i)?.[1];
+    if (viewsSection) {
+      const viewEntries = viewsSection.split(/(?:\n\s*)?-\s*/).filter(Boolean);
 
-      let views = defaultViews;
-      const viewsSectionMatch = response.match(
-        /views:([\s\S]*?)(?=\n\n|<\/|$)/i
-      );
-
-      if (viewsSectionMatch) {
+      for (const [index, entry] of viewEntries.entries()) {
         try {
-          const viewsText = viewsSectionMatch[1];
-          const viewEntries = viewsText.split(/(?:\n\s*)?-\s*/).filter(Boolean);
+          // Flexible parsing with error handling
+          const nameMatch = entry.match(/name\s*[:=]\s*["']?([\w-]+)["']?/i);
+          const angleMatch = entry.match(
+            /angle\s*[:=]\s*\[?\s*([-\d\s.,]+)\s*\]?/i
+          );
+          const distanceMatch = entry.match(/distance\s*[:=]\s*(\d+)/i);
 
-          views = viewEntries.map((viewText) => {
-            const nameMatch = viewText.match(/name\s*:\s*"([^"]+)"/i);
-            const angleMatch = viewText.match(/angle\s*:\s*\[([^\]]+)\]/i);
-            const distanceMatch = viewText.match(/distance\s*:\s*(\d+)/i);
+          if (!nameMatch?.[1])
+            throw new Error(`Missing name in view ${index + 1}`);
+          if (!angleMatch?.[1])
+            throw new Error(`Missing angles in view ${index + 1}`);
 
-            if (!nameMatch || !angleMatch) {
-              throw new Error("Invalid view format - missing required fields");
-            }
+          const angleParts = angleMatch[1]
+            .split(/,\s*|\s+/)
+            .map(Number)
+            .filter((n) => !isNaN(n));
 
-            const angleParts = angleMatch[1].split(/\s*,\s*/).map(Number);
-            if (angleParts.length !== 3 || angleParts.some(isNaN)) {
-              throw new Error(`Invalid angle values: ${angleMatch[1]}`);
-            }
+          if (angleParts.length !== 3)
+            throw new Error(`Invalid angles in view ${index + 1}`);
 
-            return {
-              name: nameMatch[1],
-              angle: angleParts as [number, number, number],
-              distance: distanceMatch ? parseInt(distanceMatch[1], 10) : 100,
-            };
+          views.push({
+            name: nameMatch[1].toLowerCase(),
+            angle: angleParts as [number, number, number],
+            distance: distanceMatch ? parseInt(distanceMatch[1], 10) : 150,
           });
-
-          console.log("Successfully parsed views:", views);
         } catch (error) {
-          console.warn("Failed to parse views section, using defaults:", error);
-          views = defaultViews;
+          viewErrors.push(
+            `View ${index + 1}: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
         }
       }
 
-      return { code, views };
-    } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `Failed to parse response: ${errorMessage}\n\nPlease try the command again.`
-      );
+      if (viewErrors.length > 0) {
+        console.warn("View parsing issues:\n" + viewErrors.join("\n"));
+      }
     }
-  }
 
+    // Default views if parsing failed
+    const defaultViews: ViewSpec[] = [
+      { name: "front", angle: [0, 0, 0], distance: 150 },
+      { name: "back", angle: [180, 0, 0], distance: 150 },
+      { name: "left", angle: [90, 0, 0], distance: 150 },
+      { name: "right", angle: [-90, 0, 0], distance: 150 },
+      { name: "top", angle: [0, 90, 0], distance: 200 },
+      { name: "bottom", angle: [0, -90, 0], distance: 200 },
+      { name: "iso", angle: [45, 35, 15], distance: 300 },
+    ];
+
+    return {
+      code,
+      views: views.length > 3 ? views : defaultViews, // Only use parsed views if most are valid
+    };
+  }
   private formatInitialPrompt(prompt: string): string {
     return `Design a 3D model based on this description:
 ${prompt}
