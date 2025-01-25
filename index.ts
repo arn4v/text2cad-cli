@@ -7,7 +7,6 @@ import { join } from "path";
 import { tmpdir, homedir } from "os";
 import { randomUUID } from "crypto";
 
-// Types
 interface ViewSpec {
   name: string;
   angle: [number, number, number];
@@ -21,7 +20,7 @@ interface CADModel {
 
 interface RenderResult {
   view: string;
-  image: string; // base64
+  image: string;
 }
 
 interface IterationState {
@@ -38,69 +37,41 @@ interface ProjectState {
   iterations: IterationState[];
 }
 
-interface ImageContent {
-  type: "image";
-  source: {
-    type: "base64";
-    media_type: "image/png";
-    data: string;
-  };
-}
+type MessageContent =
+  | { type: "text"; text: string }
+  | {
+      type: "image";
+      source: { type: "base64"; media_type: "image/png"; data: string };
+    };
 
-interface TextContent {
-  type: "text";
-  text: string;
-}
+const SYSTEM_PROMPT = `You are an expert CAD designer using OpenSCAD. Follow these guidelines:
 
-type MessageContent = TextContent | ImageContent;
+1. Design Principles:
+- Use engineering best practices
+- Include parametric variables
+- Add clearance tolerances (0.2-0.5mm)
+- Ensure printability/manufacturability
 
-// Constants
-const SYSTEM_PROMPT = `You are an expert CAD designer using OpenSCAD. Follow these strict rules:
+2. View Requirements:
+- Standard engineering views:
+  * front: [0, 0, 0] distance: 150
+  * top: [90, 0, 0] distance: 200
+  * iso: [45, 35, 15] distance: 250
+- Minimum 3 views showing key features
 
-1. VIEW ORIENTATION:
-- Use standard engineering views with RIGHT-HAND RULE coordinate system:
-  * +X = Right, +Y = Back, +Z = Up
-  * Front view looks along +Y axis
-  * Top view looks along +Z axis
-- Include these required views:
-  * front: [0, 0, 0] (facing forward)
-  * back: [0, 180, 0]
-  * left: [0, 90, 0]
-  * right: [0, -90, 0]
-  * top: [90, 0, 0]
-  * bottom: [-90, 0, 0]
-  * iso: [45, 35, 0]
-
-2. COMPONENT PLACEMENT:
-- Ports/connectors must be on correct faces:
-  * USB/HDMI on front/back as per actual device
-  * Mounting holes on bottom
-  * Ventilation on top/sides
-- Verify component orientation with 3D coordinate system
-
-3. DESIGN RULES:
-- Model origin at center of base
-- Align components with axes
-- Add comments for complex geometry
-
-4. RESPONSE FORMAT:
+3. Response Format:
 <openscad>
-// Code here
+// Parameterized code here
 </openscad>
 
 views:
 - name: "front" angle: [0,0,0] distance: 150
-- name: "back" angle: [0,180,0] distance: 150
-- name: "left" angle: [0,90,0] distance: 150
-- name: "right" angle: [0,-90,0] distance: 150 
-- name: "top" angle: [90,0,0] distance: 150
-- name: "bottom" angle: [-90,0,0] distance: 150
-- name: "iso" angle: [45,35,0] distance: 200`;
+- name: "top" angle: [90,0,0] distance: 200
+- name: "iso" angle: [45,35,15] distance: 250`;
 
 const STATE_DIR = join(homedir(), ".cad-forge");
 const RENDERS_DIR = join(STATE_DIR, "renders");
 
-// OpenSCAD Renderer
 class OpenSCADRenderer {
   private tempDir: string | null = null;
 
@@ -121,32 +92,29 @@ class OpenSCADRenderer {
       const outputFile = join(this.tempDir, `${view.name}.png`);
 
       try {
+        const validatedDistance = Math.max(view.distance, 50);
+        const [rotX, rotY, rotZ] = view.angle;
+
         // Convert angles to radians
-        const azimuth = (view.angle[0] * Math.PI) / 180;
-        const elevation = (view.angle[1] * Math.PI) / 180;
-        const tilt = (view.angle[2] * Math.PI) / 180;
+        const radX = (rotX * Math.PI) / 180;
+        const radY = (rotY * Math.PI) / 180;
+        const radZ = (rotZ * Math.PI) / 180;
 
-        // Calculate eye position using spherical coordinates
+        // Calculate camera position
         const eye = [
-          view.distance * Math.cos(azimuth) * Math.cos(elevation),
-          view.distance * Math.sin(azimuth) * Math.cos(elevation),
-          view.distance * Math.sin(elevation),
+          validatedDistance * Math.cos(radY) * Math.cos(radZ),
+          validatedDistance * Math.sin(radZ),
+          validatedDistance * Math.sin(radY),
         ];
 
-        // Calculate center point with tilt adjustment
-        const center = [
-          Math.cos(tilt) * 0.1 * view.distance,
-          Math.sin(tilt) * 0.1 * view.distance,
-          0,
-        ];
-
-        const cameraParams = `=${eye.join(",")},${center.join(",")}`;
+        // Calculate look-at point (center)
+        const center = [0, 0, 0];
 
         await execa("openscad", [
           "-o",
           outputFile,
           "--camera",
-          cameraParams,
+          `=${eye.join(",")},${center.join(",")}`,
           "--viewall",
           "--imgsize=1024,768",
           "--colorscheme=Cornfield",
@@ -163,12 +131,11 @@ class OpenSCADRenderer {
           view: view.name,
           image: imageData.toString("base64"),
         });
-
         console.log(`Rendered ${view.name} view to: ${finalPath}`);
       } catch (error) {
         await this.cleanup();
         throw new Error(
-          `Failed to render ${view.name}: ${
+          `Render failed: ${
             error instanceof Error ? error.message : String(error)
           }`
         );
@@ -186,7 +153,7 @@ class OpenSCADRenderer {
     this.tempDir = null;
   }
 }
-// LLM Session Handler
+
 class CADSession {
   private state: ProjectState | null = null;
   private anthropic: Anthropic;
@@ -203,10 +170,9 @@ class CADSession {
       originalPrompt: prompt,
       iterations: [],
     };
-
     const model = await this.createModel({
       role: "user",
-      content: this.formatInitialPrompt(prompt),
+      content: prompt,
     });
     await this.addIteration(model);
     return model;
@@ -214,17 +180,12 @@ class CADSession {
 
   async iterateModel(feedback: string): Promise<CADModel> {
     await this.loadState();
-
-    if (!this.state || this.state.iterations.length === 0) {
-      throw new Error('No previous model found. Use "create" first.');
+    if (!this.state?.iterations.length) {
+      throw new Error("No previous model found");
     }
 
     const lastIteration =
       this.state.iterations[this.state.iterations.length - 1];
-    if (!lastIteration.renders || lastIteration.renders.length === 0) {
-      throw new Error("No renders found from previous iteration");
-    }
-
     const model = await this.createModel({
       role: "user",
       content: this.formatIterationMessage(feedback, lastIteration.renders),
@@ -242,41 +203,21 @@ class CADSession {
       model: "claude-3-5-sonnet-latest",
       max_tokens: 4096,
       system: SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: message.content,
-        },
-      ] satisfies Anthropic.Messages.MessageParam[],
+      messages: [message],
       stream: true,
     });
 
     let fullResponse = "";
-    let lastChunkWasNewline = false;
-
     for await (const chunk of response) {
       if (
         chunk.type === "content_block_delta" &&
         chunk.delta.type === "text_delta"
       ) {
-        const text = chunk.delta.text;
-        if (text === "\n") {
-          if (!lastChunkWasNewline) {
-            process.stdout.write(text);
-            lastChunkWasNewline = true;
-          }
-        } else {
-          process.stdout.write(text);
-          lastChunkWasNewline = false;
-        }
-        fullResponse += text;
+        process.stdout.write(chunk.delta.text);
+        fullResponse += chunk.delta.text;
       }
     }
-
-    if (!lastChunkWasNewline) {
-      console.log();
-    }
-
+    console.log();
     return this.parseResponse(fullResponse);
   }
 
@@ -284,90 +225,48 @@ class CADSession {
     const codeMatch = response.match(/<openscad>([\s\S]*?)<\/openscad>/i);
     if (!codeMatch) throw new Error("Missing OpenSCAD code section");
 
-    const code = codeMatch[1].trim();
     const views: ViewSpec[] = [];
-    const viewErrors: string[] = [];
+    const viewSection = response.match(/views:([\s\S]*?)(?=\n\n|<\/|$)/i)?.[1];
 
-    const viewsSection = response.match(/views:([\s\S]*?)(?=\n\n|<\/|$)/i)?.[1];
-    if (viewsSection) {
-      const viewEntries = viewsSection.split(/(?:\n\s*)?-\s*/).filter(Boolean);
-
-      for (const [index, entry] of viewEntries.entries()) {
+    if (viewSection) {
+      const viewEntries = viewSection.split(/-\s*/).slice(1);
+      for (const entry of viewEntries) {
         try {
-          // Flexible parsing with error handling
-          const nameMatch = entry.match(/name\s*[:=]\s*["']?([\w-]+)["']?/i);
-          const angleMatch = entry.match(
-            /angle\s*[:=]\s*\[?\s*([-\d\s.,]+)\s*\]?/i
-          );
-          const distanceMatch = entry.match(/distance\s*[:=]\s*(\d+)/i);
+          const nameMatch = entry.match(/name\s*:\s*"([^"]+)"/i);
+          const angleMatch = entry.match(/angle\s*:\s*\[([^\]]+)\]/i);
+          const distanceMatch = entry.match(/distance\s*:\s*(\d+)/i);
 
-          if (!nameMatch?.[1])
-            throw new Error(`Missing name in view ${index + 1}`);
-          if (!angleMatch?.[1])
-            throw new Error(`Missing angles in view ${index + 1}`);
+          if (!nameMatch?.[1] || !angleMatch?.[1]) continue;
 
           const angleParts = angleMatch[1]
-            .split(/,\s*|\s+/)
+            .split(/\s*,\s*/)
             .map(Number)
             .filter((n) => !isNaN(n));
 
-          if (angleParts.length !== 3)
-            throw new Error(`Invalid angles in view ${index + 1}`);
+          if (angleParts.length !== 3) continue;
 
           views.push({
             name: nameMatch[1].toLowerCase(),
             angle: angleParts as [number, number, number],
-            distance: distanceMatch ? parseInt(distanceMatch[1], 10) : 150,
+            distance: distanceMatch ? parseInt(distanceMatch[1]) : 150,
           });
         } catch (error) {
-          viewErrors.push(
-            `View ${index + 1}: ${
-              error instanceof Error ? error.message : String(error)
-            }`
-          );
+          console.warn("Skipping invalid view entry:", error);
         }
-      }
-
-      if (viewErrors.length > 0) {
-        console.warn("View parsing issues:\n" + viewErrors.join("\n"));
       }
     }
 
-    // Default views if parsing failed
-    const defaultViews: ViewSpec[] = [
-      { name: "front", angle: [0, 0, 0], distance: 150 },
-      { name: "back", angle: [180, 0, 0], distance: 150 },
-      { name: "left", angle: [90, 0, 0], distance: 150 },
-      { name: "right", angle: [-90, 0, 0], distance: 150 },
-      { name: "top", angle: [0, 90, 0], distance: 200 },
-      { name: "bottom", angle: [0, -90, 0], distance: 200 },
-      { name: "iso", angle: [45, 35, 15], distance: 300 },
-    ];
-
     return {
-      code,
-      views: views.length > 3 ? views : defaultViews, // Only use parsed views if most are valid
+      code: codeMatch[1].trim(),
+      views:
+        views.length >= 3
+          ? views
+          : [
+              { name: "front", angle: [0, 0, 0], distance: 150 },
+              { name: "top", angle: [90, 0, 0], distance: 200 },
+              { name: "iso", angle: [45, 35, 15], distance: 250 },
+            ],
     };
-  }
-  private formatInitialPrompt(prompt: string): string {
-    return `Design a 3D model based on this description:
-${prompt}
-
-IMPORTANT: Your response must follow this exact format:
-
-<openscad>
-// OpenSCAD code here
-</openscad>
-
-views:
-- name: "front"
-  angle: [0, 0, 0]
-  distance: 100
-- name: "iso"
-  angle: [45, 35, 0]
-  distance: 100
-
-Do not include any other text between these sections.`;
   }
 
   private formatIterationMessage(
@@ -376,21 +275,14 @@ Do not include any other text between these sections.`;
   ): MessageContent[] {
     if (!this.state) throw new Error("No active session");
 
-    const latestCode =
-      this.state.iterations[this.state.iterations.length - 1].code;
-
     const content: MessageContent[] = [
       {
         type: "text",
-        text: `Original request: ${this.state.originalPrompt}
-
-Previous OpenSCAD code:
-${latestCode}
-
-User feedback:
-${feedback}
-
-Please analyze the following renders and make the requested improvements:`,
+        text: `Original Request: ${
+          this.state.originalPrompt
+        }\n\nFeedback: ${feedback}\n\nCurrent Code:\n${
+          this.state.iterations[this.state.iterations.length - 1].code
+        }\n\nPlease analyze these renders:`,
       },
     ];
 
@@ -406,14 +298,14 @@ Please analyze the following renders and make the requested improvements:`,
         },
         {
           type: "text",
-          text: `↑ ${render.view} view`,
+          text: `${render.view} view`,
         }
       );
     });
 
     content.push({
       type: "text",
-      text: "Provide updated OpenSCAD code and view specifications following the standard format.",
+      text: "Provide improved OpenSCAD code maintaining the required format.",
     });
 
     return content;
@@ -421,15 +313,12 @@ Please analyze the following renders and make the requested improvements:`,
 
   private async addIteration(model: CADModel, feedback?: string) {
     if (!this.state) throw new Error("No active session");
-
-    const iteration: IterationState = {
+    this.state.iterations.push({
       timestamp: new Date().toISOString(),
       code: model.code,
       renders: [],
       feedback,
-    };
-
-    this.state.iterations.push(iteration);
+    });
     await this.saveState();
   }
 
@@ -438,45 +327,39 @@ Please analyze the following renders and make the requested improvements:`,
       const data = await readFile(this.stateFile, "utf8");
       this.state = JSON.parse(data);
     } catch (error) {
-      throw new Error('No existing CAD session found. Use "create" first.');
+      throw new Error("No existing session found");
     }
   }
 
   private async saveState() {
     if (!this.state) throw new Error("No active session");
-
     await mkdir(STATE_DIR, { recursive: true });
     await writeFile(this.stateFile, JSON.stringify(this.state, null, 2));
   }
 }
 
-// CLI Setup
 async function main() {
   const cli = cac("cad-forge");
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    console.error(`Error: ANTHROPIC_API_KEY environment variable is required.
-Create a .env file in the project root with:
-ANTHROPIC_API_KEY=your-api-key-here`);
+    console.error("ANTHROPIC_API_KEY environment variable required");
     process.exit(1);
   }
 
   try {
     await execa("openscad", ["--version"]);
-  } catch (error) {
-    console.error("Error: OpenSCAD must be installed and available in PATH");
+  } catch {
+    console.error("OpenSCAD not found in PATH");
     process.exit(1);
   }
 
-  await mkdir(STATE_DIR, { recursive: true });
   await mkdir(RENDERS_DIR, { recursive: true });
-
   const session = new CADSession(apiKey);
   const renderer = new OpenSCADRenderer();
 
   cli
-    .command("create <prompt>", "Create a new CAD model")
+    .command("create <prompt>", "Create new CAD design")
     .action(async (prompt: string) => {
       try {
         console.log("Generating model...");
@@ -494,22 +377,21 @@ ANTHROPIC_API_KEY=your-api-key-here`);
         );
 
         console.log("\nModel created successfully!");
-        console.log("\nOpenSCAD code:");
-        console.log(model.code);
-        console.log("\nRenders saved to:", RENDERS_DIR);
-      } catch (error: unknown) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        console.error("Error:", errorMessage);
+        console.log("Renders saved to:", RENDERS_DIR);
+      } catch (error) {
+        console.error(
+          "Error:",
+          error instanceof Error ? error.message : String(error)
+        );
         process.exit(1);
       }
     });
 
   cli
-    .command("iterate <feedback>", "Improve existing model based on feedback")
+    .command("iterate <feedback>", "Improve existing design")
     .action(async (feedback: string) => {
       try {
-        console.log("Loading previous model...");
+        console.log("Processing feedback...");
         const model = await session.iterateModel(feedback);
         console.log("Rendering new views...");
         const renders = await renderer.render(model);
@@ -523,14 +405,13 @@ ANTHROPIC_API_KEY=your-api-key-here`);
           JSON.stringify(projectState, null, 2)
         );
 
-        console.log("\nModel updated successfully!");
-        console.log("\nUpdated OpenSCAD code:");
-        console.log(model.code);
-        console.log("\nRenders saved to:", RENDERS_DIR);
-      } catch (error: unknown) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        console.error("Error:", errorMessage);
+        console.log("\nDesign updated successfully!");
+        console.log("Updated renders saved to:", RENDERS_DIR);
+      } catch (error) {
+        console.error(
+          "Error:",
+          error instanceof Error ? error.message : String(error)
+        );
         process.exit(1);
       }
     });
